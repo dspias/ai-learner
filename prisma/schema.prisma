@@ -1,0 +1,316 @@
+// AI Learner — data model.
+// Tenancy is enforced in application code via `userId`; the schema is
+// multi-user-ready. Cascades flow Goal -> Milestone -> Topic -> children.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum TopicStatus {
+  not_started
+  in_progress
+  learned
+  needs_review
+}
+
+enum MessageRole {
+  user
+  assistant
+}
+
+enum QuizItemType {
+  mcq
+  short_answer
+  coding
+}
+
+enum SessionActivity {
+  lesson
+  chat
+  quiz
+  review
+  mixed
+}
+
+// ---------------------------------------------------------------------------
+// Auth.js (NextAuth) models
+// ---------------------------------------------------------------------------
+
+model User {
+  id              String    @id @default(cuid())
+  name            String?
+  email           String?   @unique
+  emailVerified   DateTime?
+  image           String?
+  passwordHash    String? // for the Credentials provider
+  defaultLanguage String    @default("English") // profile default for new goals
+  plan            String    @default("free") // subscription plan id
+  planPeriodStart DateTime  @default(now()) // anchor for the rolling token period
+  createdAt       DateTime  @default(now())
+
+  // Stripe billing (nullable until the user subscribes)
+  stripeCustomerId       String?   @unique
+  stripeSubscriptionId   String?
+  stripeStatus           String?
+  stripeCurrentPeriodEnd DateTime?
+
+  accounts   Account[]
+  sessions   Session[]
+  tokenUsage TokenUsage[]
+}
+
+// Append-only ledger of LLM token usage, summed per period to enforce quotas.
+model TokenUsage {
+  id           String   @id @default(cuid())
+  userId       String
+  feature      String // topic_tree | lesson | chat | quiz | grade
+  provider     String // anthropic | openai
+  model        String
+  inputTokens  Int      @default(0)
+  outputTokens Int      @default(0)
+  totalTokens  Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Domain models
+// ---------------------------------------------------------------------------
+
+model Goal {
+  id           String   @id @default(cuid())
+  userId       String
+  title        String // "Software Engineer → AI Engineer"
+  background   String   @default("") // the learner's described background
+  language     String   @default("English") // language for this goal's generated content
+  targetDate   DateTime?
+  dailyMinutes Int      @default(30)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  milestones    Milestone[]
+  topics        Topic[]
+  studySessions StudySession[]
+
+  @@index([userId])
+}
+
+model Milestone {
+  id          String   @id @default(cuid())
+  userId      String
+  goalId      String
+  title       String // "Phase 3: Machine Learning"
+  description String?
+  position    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  goal   Goal    @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  topics Topic[]
+
+  @@index([goalId, position])
+  @@index([userId])
+}
+
+model Topic {
+  id                String      @id @default(cuid())
+  userId            String
+  goalId            String // denormalized for goal-wide queries
+  milestoneId       String
+  title             String
+  summary           String? // short one-liner for the tree
+  status            TopicStatus @default(not_started)
+  masteryScore      Int         @default(0) // 0–100
+  position          Int         @default(0)
+  lessonMd          String? // stored generated explanation
+  lessonGeneratedAt DateTime?
+  lastStudiedAt     DateTime?
+  nextReviewAt      DateTime?
+  reviewStage       Int         @default(0) // index into the interval ladder
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  goal      Goal      @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  milestone Milestone @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+
+  prerequisites TopicPrerequisite[] @relation("TopicToPrereq")
+  requiredBy    TopicPrerequisite[] @relation("PrereqToTopic")
+  chatMessages  TopicChatMessage[]
+  note          Note?
+  quizAttempts  QuizAttempt[]
+  quizItems     QuizItem[]
+  mistakes      Mistake[]
+  sessionLinks  StudySessionTopic[]
+
+  @@index([milestoneId, position])
+  @@index([goalId])
+  @@index([userId, nextReviewAt])
+}
+
+model TopicPrerequisite {
+  topicId             String
+  prerequisiteTopicId String
+  userId              String
+
+  topic        Topic @relation("TopicToPrereq", fields: [topicId], references: [id], onDelete: Cascade)
+  prerequisite Topic @relation("PrereqToTopic", fields: [prerequisiteTopicId], references: [id], onDelete: Cascade)
+
+  @@id([topicId, prerequisiteTopicId])
+  @@index([userId])
+}
+
+model TopicChatMessage {
+  id        String      @id @default(cuid())
+  userId    String
+  topicId   String
+  role      MessageRole
+  content   String
+  createdAt DateTime    @default(now())
+
+  topic Topic @relation(fields: [topicId], references: [id], onDelete: Cascade)
+
+  @@index([topicId, createdAt])
+}
+
+model Note {
+  id        String   @id @default(cuid())
+  userId    String
+  topicId   String   @unique // one markdown doc per topic
+  contentMd String   @default("")
+  updatedAt DateTime @updatedAt
+
+  topic Topic @relation(fields: [topicId], references: [id], onDelete: Cascade)
+}
+
+model QuizAttempt {
+  id           String   @id @default(cuid())
+  userId       String
+  topicId      String
+  numQuestions Int
+  numCorrect   Int      @default(0)
+  score        Float    @default(0) // percent 0–100
+  isReview     Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  topic Topic      @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  items QuizItem[]
+
+  @@index([topicId, createdAt])
+}
+
+model QuizItem {
+  id            String       @id @default(cuid())
+  userId        String
+  attemptId     String
+  topicId       String
+  position      Int          @default(0)
+  type          QuizItemType
+  question      String
+  options       Json? // for MCQ
+  correctAnswer String?
+  userAnswer    String?
+  isCorrect     Boolean?
+  feedback      String? // AI feedback for this answer
+  concept       String? // concept tested; feeds Mistakes
+
+  attempt QuizAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  topic   Topic       @relation(fields: [topicId], references: [id], onDelete: Cascade)
+
+  mistakes Mistake[]
+
+  @@index([attemptId, position])
+}
+
+model Mistake {
+  id         String   @id @default(cuid())
+  userId     String
+  topicId    String
+  quizItemId String?
+  concept    String // the thing I got wrong
+  detail     String? // the misunderstanding
+  resolved   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  topic    Topic     @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  quizItem QuizItem? @relation(fields: [quizItemId], references: [id], onDelete: SetNull)
+
+  @@index([topicId, resolved])
+}
+
+model StudySession {
+  id        String          @id @default(cuid())
+  userId    String
+  goalId    String?
+  startedAt DateTime        @default(now())
+  endedAt   DateTime?
+  minutes   Int             @default(0)
+  activity  SessionActivity @default(mixed)
+  summary   String?
+  createdAt DateTime        @default(now())
+
+  goal   Goal?               @relation(fields: [goalId], references: [id], onDelete: SetNull)
+  topics StudySessionTopic[]
+
+  @@index([userId, startedAt])
+}
+
+model StudySessionTopic {
+  sessionId String
+  topicId   String
+  userId    String
+
+  session StudySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  topic   Topic        @relation(fields: [topicId], references: [id], onDelete: Cascade)
+
+  @@id([sessionId, topicId])
+  @@index([userId])
+}

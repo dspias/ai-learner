@@ -1,0 +1,54 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ai_learner_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_learner
+    ports:
+      - "5432:5432"
+    volumes:
+      - ai_learner_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_learner"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    image: node:22-slim
+    container_name: ai_learner_app
+    working_dir: /app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Override the host DATABASE_URL to reach Postgres over the compose network.
+      DATABASE_URL: "postgresql://postgres:postgres@db:5432/ai_learner?schema=public"
+      AUTH_URL: "http://localhost:3000"
+      AUTH_TRUST_HOST: "true"
+      # Prisma needs OpenSSL present in node:22-slim.
+      NODE_ENV: "development"
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - ai_learner_node_modules:/app/node_modules
+      # Keep the container's dev build isolated from any host `next build`.
+      - ai_learner_next:/app/.next
+    command: >
+      sh -c "apt-get update -qq && apt-get install -y -qq openssl >/dev/null 2>&1 &&
+             npm install &&
+             npx prisma db push &&
+             npm run db:seed &&
+             npm run dev -- -H 0.0.0.0 -p 3000"
+
+volumes:
+  ai_learner_pgdata:
+  ai_learner_node_modules:
+  ai_learner_next:
